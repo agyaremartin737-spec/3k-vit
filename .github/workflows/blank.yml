@@ -1,70 +1,196 @@
-name: Build Non-JIT Playable Vita3K iOS App
+
+name: Build Vion iOS (arm64, Non-JIT)
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: vion-ios-build-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build_ios:
-    name: Native Xcode iOS Compile
+    name: Build Native iOS App
     runs-on: macos-14
+    timeout-minutes: 180
 
     steps:
-      - name: Checkout Code Base
+      - name: Checkout Vion
         uses: actions/checkout@v4
         with:
-          repository: 'vion-app-org/Vion'
-          ref: 'native-ios-port'
+          repository: vion-app-org/Vion
+          ref: native-ios-port
           submodules: recursive
           fetch-depth: 0
 
-      - name: Select Xcode App Environment
+      - name: Select Xcode
+        shell: bash
         run: |
-          sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer || sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          set -euo pipefail
 
-      - name: Configure CMake for Apple Xcode
-        env:
-          CI: false # Prevents compiler warnings from being treated as catastrophic failures
+          if [ -d "/Applications/Xcode_15.4.app/Contents/Developer" ]; then
+            sudo xcode-select \
+              -s /Applications/Xcode_15.4.app/Contents/Developer
+          else
+            sudo xcode-select -s "$(xcode-select -p)"
+          fi
+
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          clang --version
+
+      - name: Install Build Tools
+        shell: bash
         run: |
-          set -x # Enables verbose script debug mapping
-          cmake -B build_ios \
-            -G "Xcode" \
+          set -euo pipefail
+          brew install cmake ninja pkg-config
+
+          cmake --version
+          ninja --version
+
+      - name: Verify Source and Submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f CMakeLists.txt || {
+            echo "::error::Root CMakeLists.txt is missing"
+            exit 1
+          }
+
+          git submodule status --recursive
+          git status --short
+
+      - name: Configure iOS Build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cmake -S . -B build_ios \
+            -G Xcode \
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_SYSROOT=iphoneos \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
             -DCMAKE_BUILD_TYPE=Release \
-            -DENABLE_CODE_SIGNING=OFF \
             -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
+            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED=NO \
             -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY="" \
-            -DCMAKE_XCODE_ATTRIBUTE_DEBUG_INFORMATION_FORMAT="dwarf" \
-            -DCMAKE_CXX_FLAGS="-O3 -flto -DNDEBUG -w" \
-            -DCMAKE_C_FLAGS="-O3 -flto -DNDEBUG -w"
+            -DCMAKE_CXX_STANDARD=20 \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DUSE_LTO=NEVER \
+            2>&1 | tee configure.log
 
-      - name: Execute Xcode Build Compilation
-        env:
-          CI: false
+      - name: List Available Build Targets
+        if: success()
+        shell: bash
         run: |
-          cmake --build build_ios --config Release -- -sdk iphoneos || (echo "Building failed. Fetching diagnostic lines..." && exit 1)
+          set -euo pipefail
+          cmake --build build_ios --config Release -- -list \
+            2>&1 | tee targets.log
 
-      - name: Dynamically Find and Package Binary Output
+      - name: Compile for iOS Device
+        shell: bash
         run: |
-          mkdir -p build_ios/ipa/Payload
-          
-          TARGET_APP=$(find build_ios -name "*.app" -type d | head -n 1)
-          
-          if [ -z "$TARGET_APP" ]; then
-            echo "❌ ERROR: No compiled app binary found in the build directory!"
+          set -o pipefail
+
+          cmake --build build_ios \
+            --config Release \
+            --parallel 3 \
+            2>&1 | tee build.log
+
+      - name: Locate and Validate App
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PRODUCTS="build_ios/Build/Products/Release-iphoneos"
+          mkdir -p "$PRODUCTS"
+
+          echo "Searching for iOS app bundles..."
+
+          find build_ios -type d -name '*.app' \
+            -not -path '*/Index.noindex/*' \
+            -print | tee app_candidates.txt || true
+
+          APP_PATH=""
+
+          if [ -d "$PRODUCTS" ]; then
+            while IFS= read -r candidate; do
+              if [ -f "$candidate/Info.plist" ] &&
+                 /usr/libexec/PlistBuddy \
+                   -c 'Print :CFBundleExecutable' \
+                   "$candidate/Info.plist" >/dev/null 2>&1; then
+                APP_PATH="$candidate"
+                break
+              fi
+            done < <(
+              find "$PRODUCTS" -maxdepth 1 -type d -name '*.app'
+            )
+          fi
+
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::No valid iOS .app bundle was produced."
+            echo "Inspect build.log and targets.log."
+            echo "A compiled command-line executable is not an iOS app bundle."
             exit 1
           fi
-          
-          echo "Found compiled app package at: $TARGET_APP"
-          cp -r "$TARGET_APP" build_ios/ipa/Payload/
-          
-          cd build_ios/ipa
-          zip -9 -r ../../Vion_Vita3K_NoJIT_Interpreter.ipa Payload
-          cd ../..
 
-      - name: Export Executable Asset
+          EXECUTABLE=$(/usr/libexec/PlistBuddy \
+            -c 'Print :CFBundleExecutable' \
+            "$APP_PATH/Info.plist")
+
+          if [ ! -f "$APP_PATH/$EXECUTABLE" ]; then
+            echo "::error::The app executable is missing."
+            exit 1
+          fi
+
+          echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
+          echo "Found app bundle: $APP_PATH"
+          echo "Executable: $EXECUTABLE"
+          file "$APP_PATH/$EXECUTABLE"
+          plutil -lint "$APP_PATH/Info.plist"
+
+      - name: Package IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IPA_DIR="$GITHUB_WORKSPACE/ipa/Payload"
+          OUTPUT="$GITHUB_WORKSPACE/Vion_Vita3K_NoJIT.ipa"
+
+          mkdir -p "$IPA_DIR"
+          ditto "$APP_PATH" "$IPA_DIR/$(basename "$APP_PATH")"
+
+          cd "$GITHUB_WORKSPACE/ipa"
+          /usr/bin/zip -qry "$OUTPUT" Payload
+
+          test -s "$OUTPUT"
+          unzip -t "$OUTPUT"
+
+          echo "IPA created: $OUTPUT"
+          ls -lh "$OUTPUT"
+
+      - name: Upload Build Diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vion-ios-build-diagnostics
+          if-no-files-found: ignore
+          path: |
+            configure.log
+            targets.log
+            build.log
+            app_candidates.txt
+
+      - name: Upload IPA
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: Non-JIT-Vita3K-IPA
-          path: Vion_Vita3K_NoJIT_Interpreter.ipa
+          path: Vion_Vita3K_NoJIT.ipa
+          if-no-files-found: error
+          retention-days: 7
