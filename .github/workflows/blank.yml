@@ -1,274 +1,187 @@
 
-name: Build Vion Vita3K iOS 16-26 Non-JIT
+name: Vion iOS Non-JIT Build
 
 on:
   workflow_dispatch:
+    inputs:
+      ios_deployment_target:
+        description: "Minimum iOS deployment target"
+        required: true
+        default: "16.0"
+        type: choice
+        options:
+          - "16.0"
+          - "17.0"
+          - "18.0"
 
 permissions:
   contents: read
 
 concurrency:
-  group: vion-ios-build-${{ github.ref }}
-  cancel-in-progress: false
+  group: vion-ios-nonjit-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build_ios:
-    name: Build iOS Device App
-    runs-on: macos-15
-    timeout-minutes: 180
-
-    env:
-      IOS_MIN_VERSION: "16.0"
-      BUILD_CONFIGURATION: Release
-      BUILD_DIR: build_ios
+  build:
+    name: Build Vion for iOS
+    runs-on: macos-26
+    timeout-minutes: 360
 
     steps:
-      - name: Checkout Vion Source
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          set -euxo pipefail
+          xcode-select -p
+          xcodebuild -version
+          swift --version
+          cmake --version || brew install cmake
+          git --version
+
+      - name: Checkout Vion source and submodules
         uses: actions/checkout@v4
         with:
           repository: vion-app-org/Vion
           ref: native-ios-port
+          path: source
           submodules: recursive
-          fetch-depth: 0
+          fetch-depth: 1
+          persist-credentials: false
 
-      - name: Locate Compatible Xcode and iOS SDK
+      - name: Verify source tree
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -f source/CMakeLists.txt
+          test -d source/.git
+          git -C source submodule status
+          echo "Top-level CMake options:"
+          grep -nE 'option\\(|IOS|ARCHITECTURE' \
+            source/CMakeLists.txt | head -100 || true
+
+      - name: Fix OpenSSL iOS deployment target
+        env:
+          IOS_TARGET: ${{ inputs.ios_deployment_target }}
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Available Xcode installations:"
-          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
 
-          SELECTED_XCODE=""
-          SELECTED_SDK=""
+          path = Path("source/external/CMakeLists.txt")
+          if not path.is_file():
+              raise SystemExit(f"Missing expected file: {path}")
 
-          for XCODE in /Applications/Xcode*.app; do
-            [ -d "$XCODE/Contents/Developer" ] || continue
+          text = path.read_text()
+          replacements = {
+              "perl Configure ios64-xcrun -miphoneos-version-min=18.0":
+              'perl Configure ios64-xcrun -miphoneos-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}',
+              "perl Configure iossimulator-xcrun -miphonesimulator-version-min=18.0":
+              'perl Configure iossimulator-xcrun -miphonesimulator-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}',
+          }
 
-            SDK_VERSION=$(
-              DEVELOPER_DIR="$XCODE/Contents/Developer" \
-              xcrun --sdk iphoneos --show-sdk-version 2>/dev/null \
-              || true
-            )
+          changed = 0
+          for old, new in replacements.items():
+              count = text.count(old)
+              if count:
+                  text = text.replace(old, new)
+                  changed += count
 
-            if [[ "$SDK_VERSION" == 26.* ]]; then
-              SELECTED_XCODE="$XCODE"
-              SELECTED_SDK="$SDK_VERSION"
-              break
-            fi
-          done
+          if changed == 0:
+              print("Expected OpenSSL commands not found.")
+              print("The source may have changed; refusing to claim the patch was applied.")
+              raise SystemExit(1)
 
-          if [ -z "$SELECTED_XCODE" ]; then
-            echo "::error::No installed Xcode with an iOS 26 SDK was found."
-            echo "Use a GitHub runner image that includes Xcode 26."
-            exit 1
-          fi
+          path.write_text(text)
+          print(f"Updated {changed} OpenSSL deployment-target command(s).")
+          PY
 
-          sudo xcode-select \
-            -s "$SELECTED_XCODE/Contents/Developer"
+          git -C source diff -- external/CMakeLists.txt
 
-          sudo xcodebuild -license accept
-
-          echo "Selected Xcode: $SELECTED_XCODE"
-          echo "Selected iOS SDK: $SELECTED_SDK"
-
-          xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-version
-          xcodebuild -showsdks
-
-      - name: Install Build Tools
+      - name: Configure iOS arm64 build
+        env:
+          IOS_TARGET: ${{ inputs.ios_deployment_target }}
         shell: bash
         run: |
-          set -euo pipefail
+          set -euxo pipefail
 
-          if ! command -v cmake >/dev/null 2>&1; then
-            brew install cmake
-          fi
-
-          if ! command -v pkg-config >/dev/null 2>&1; then
-            brew install pkg-config
-          fi
-
-          cmake --version
-          pkg-config --version
-
-      - name: Verify Repository
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ ! -f CMakeLists.txt ]; then
-            echo "::error::Root CMakeLists.txt is missing."
-            exit 1
-          fi
-
-          echo "Source commit:"
-          git rev-parse HEAD
-
-          echo "Submodule status:"
-          git submodule status --recursive
-
-      - name: Configure iOS Device Build
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cmake \
-            -S "$GITHUB_WORKSPACE" \
-            -B "$BUILD_DIR" \
+          cmake -S source -B source/build-ios \
             -G Xcode \
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_SYSROOT=iphoneos \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET="$IOS_MIN_VERSION" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$IOS_TARGET" \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_STANDARD=20 \
-            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-            -DCMAKE_XCODE_ATTRIBUTE_IPHONEOS_DEPLOYMENT_TARGET="$IOS_MIN_VERSION" \
-            -DCMAKE_XCODE_ATTRIBUTE_SDKROOT=iphoneos \
             -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
             -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED=NO \
             -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY="" \
-            2>&1 | tee configure.log
+            -DIOS=ON \
+            -DARCHITECTURE=arm64
 
-      - name: Inspect Generated Xcode Targets
+      - name: Show available build targets
         shell: bash
         run: |
-          set -euo pipefail
+          set -euxo pipefail
+          cmake --build source/build-ios --config Release -- -list
 
-          cmake --build "$BUILD_DIR" \
-            --config Release -- -list \
-            2>&1 | tee targets.log
-
-      - name: Compile for Physical iOS Devices
+      - name: Build
         shell: bash
         run: |
           set -o pipefail
-
-          cmake --build "$BUILD_DIR" \
+          cmake --build source/build-ios \
             --config Release \
-            --parallel 3 \
+            --parallel "$(sysctl -n hw.ncpu)" \
             2>&1 | tee build.log
 
-      - name: Locate and Validate iOS Application
+      - name: Locate and package app
         shell: bash
         run: |
-          set -euo pipefail
+          set -euxo pipefail
 
-          PRODUCTS="$BUILD_DIR/Build/Products"
-          DEVICE_PRODUCTS="$PRODUCTS/Release-iphoneos"
-
-          mkdir -p "$DEVICE_PRODUCTS"
-
-          echo "Compiled application candidates:"
-          find "$PRODUCTS" -type d -name '*.app' \
-            -not -path '*/Index.noindex/*' \
-            -print | tee app_candidates.txt || true
-
-          APP_PATH=""
-
-          if [ -d "$DEVICE_PRODUCTS" ]; then
-            while IFS= read -r -d '' candidate; do
-              [ -f "$candidate/Info.plist" ] || continue
-
-              EXECUTABLE=$(
-                /usr/libexec/PlistBuddy \
-                  -c 'Print :CFBundleExecutable' \
-                  "$candidate/Info.plist" 2>/dev/null || true
-              )
-
-              BUNDLE_ID=$(
-                /usr/libexec/PlistBuddy \
-                  -c 'Print :CFBundleIdentifier' \
-                  "$candidate/Info.plist" 2>/dev/null || true
-              )
-
-              if [ -n "$EXECUTABLE" ] &&
-                 [ -n "$BUNDLE_ID" ] &&
-                 [ -f "$candidate/$EXECUTABLE" ]; then
-                APP_PATH="$candidate"
-                break
-              fi
-            done < <(
-              find "$DEVICE_PRODUCTS" -maxdepth 1 \
-                -type d -name '*.app' -print0
-            )
-          fi
+          APP_PATH="$(find source/build-ios -type d \
+            -name '*.app' -print -quit)"
 
           if [ -z "$APP_PATH" ]; then
-            echo "::error::No valid iOS device app was found."
-            echo "Check build.log and targets.log."
+            echo "No .app bundle was produced."
+            find source/build-ios -maxdepth 6 \
+              \( -name '*.app' -o -name '*.framework' \) -print
             exit 1
           fi
 
-          EXECUTABLE=$(
-            /usr/libexec/PlistBuddy \
-              -c 'Print :CFBundleExecutable' \
-              "$APP_PATH/Info.plist"
+          echo "Found app: $APP_PATH"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+            "$APP_PATH/Info.plist" || true
+
+          mkdir -p package/Payload
+          cp -R "$APP_PATH" package/Payload/
+          (
+            cd package
+            /usr/bin/zip -qry ../Vion-unsigned.ipa Payload
           )
 
-          BUNDLE_ID=$(
-            /usr/libexec/PlistBuddy \
-              -c 'Print :CFBundleIdentifier' \
-              "$APP_PATH/Info.plist"
-          )
+          test -s Vion-unsigned.ipa
 
-          plutil -lint "$APP_PATH/Info.plist"
-          file "$APP_PATH/$EXECUTABLE"
-
-          echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
-
-          echo "Application: $APP_PATH"
-          echo "Bundle identifier: $BUNDLE_ID"
-          echo "Minimum iOS version: $IOS_MIN_VERSION"
-
-      - name: Package IPA
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          IPA_ROOT="$GITHUB_WORKSPACE/ipa"
-          PAYLOAD="$IPA_ROOT/Payload"
-          OUTPUT="$GITHUB_WORKSPACE/Vion_Vita3K_iOS16-26_NonJIT.ipa"
-
-          mkdir -p "$PAYLOAD"
-
-          APP_NAME="$(basename "$APP_PATH")"
-
-          ditto "$APP_PATH" "$PAYLOAD/$APP_NAME"
-
-          cd "$IPA_ROOT"
-
-          /usr/bin/zip -qry "$OUTPUT" Payload
-
-          test -s "$OUTPUT"
-          unzip -t "$OUTPUT"
-
-          echo "Checking IPA structure..."
-
-          unzip -Z1 "$OUTPUT" | grep -q '^Payload/[^/]*/Info.plist$'
-
-          echo "IPA package created successfully."
-          ls -lh "$OUTPUT"
-
-      - name: Upload Build Diagnostics
+      - name: Upload build logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: vion-ios-build-diagnostics
+          name: vion-ios-build-logs
+          path: |
+            build.log
+            source/build-ios/CMakeFiles/CMakeOutput.log
+            source/build-ios/CMakeFiles/CMakeError.log
           if-no-files-found: ignore
           retention-days: 7
-          path: |
-            configure.log
-            targets.log
-            build.log
-            app_candidates.txt
 
-      - name: Upload IPA Artifact
+      - name: Upload unsigned IPA
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Vita3K-iOS16-26-NonJIT-IPA
-          path: Vion_Vita3K_iOS16-26_NonJIT.ipa
+          name: Vion-iOS-unsigned
+          path: Vion-unsigned.ipa
           if-no-files-found: error
           retention-days: 7
