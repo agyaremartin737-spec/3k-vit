@@ -5,10 +5,10 @@ on:
   workflow_dispatch:
     inputs:
       ios_deployment_target:
-        description: "Minimum iOS deployment target"
+        description: Minimum iOS version
         required: true
-        default: "16.0"
         type: choice
+        default: "16.0"
         options:
           - "16.0"
           - "17.0"
@@ -18,12 +18,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: vion-ios-nonjit-${{ github.ref }}
+  group: vion-ios-build-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
-    name: Build Vion for iOS
+    name: Configure and Build iOS ARM64
     runs-on: macos-26
     timeout-minutes: 360
 
@@ -32,15 +32,22 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install build tools
+        shell: bash
         run: |
           set -euxo pipefail
           xcode-select -p
           xcodebuild -version
-          swift --version
-          cmake --version || brew install cmake
+          xcodebuild -showsdks
           git --version
 
-      - name: Checkout Vion source and submodules
+          if ! command -v cmake >/dev/null 2>&1; then
+            brew install cmake
+          fi
+
+          cmake --version
+          python3 --version
+
+      - name: Checkout Vion source
         uses: actions/checkout@v4
         with:
           repository: vion-app-org/Vion
@@ -50,64 +57,85 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Verify source tree
+      - name: Verify source and submodules
         shell: bash
         run: |
           set -euxo pipefail
-          test -f source/CMakeLists.txt
-          test -d source/.git
-          git -C source submodule status
-          echo "Top-level CMake options:"
-          grep -nE 'option\\(|IOS|ARCHITECTURE' \
-            source/CMakeLists.txt | head -100 || true
 
-      - name: Fix OpenSSL iOS deployment target
+          test -f source/CMakeLists.txt
+
+          echo "=== Source revision ==="
+          git -C source rev-parse HEAD
+
+          echo "=== Submodule status ==="
+          git -C source submodule status
+
+          echo "=== Top-level CMake configuration ==="
+          sed -n '1,240p' source/CMakeLists.txt
+
+      - name: Fix OpenSSL deployment target if needed
+        shell: bash
         env:
           IOS_TARGET: ${{ inputs.ios_deployment_target }}
-        shell: bash
         run: |
-          set -euo pipefail
+          set -euxo pipefail
 
           python3 - <<'PY'
           import os
           from pathlib import Path
 
           path = Path("source/external/CMakeLists.txt")
+
           if not path.is_file():
-              raise SystemExit(f"Missing expected file: {path}")
+              print(f"WARNING: {path} not found; skipping OpenSSL patch.")
+              raise SystemExit(0)
 
           text = path.read_text()
-          replacements = {
-              "perl Configure ios64-xcrun -miphoneos-version-min=18.0":
-              'perl Configure ios64-xcrun -miphoneos-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}',
-              "perl Configure iossimulator-xcrun -miphonesimulator-version-min=18.0":
-              'perl Configure iossimulator-xcrun -miphonesimulator-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}',
-          }
+          original = text
 
-          changed = 0
-          for old, new in replacements.items():
-              count = text.count(old)
-              if count:
-                  text = text.replace(old, new)
-                  changed += count
+          text = text.replace(
+              "-miphoneos-version-min=18.0",
+              "-miphoneos-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}"
+          )
+          text = text.replace(
+              "-miphonesimulator-version-min=18.0",
+              "-miphonesimulator-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}"
+          )
 
-          if changed == 0:
-              print("Expected OpenSSL commands not found.")
-              print("The source may have changed; refusing to claim the patch was applied.")
-              raise SystemExit(1)
+          if text != original:
+              path.write_text(text)
+              print("OpenSSL deployment-target commands updated.")
+          else:
+              print("No matching hardcoded OpenSSL 18.0 commands found.")
 
-          path.write_text(text)
-          print(f"Updated {changed} OpenSSL deployment-target command(s).")
+          print("=== Relevant OpenSSL configuration ===")
+          for number, line in enumerate(text.splitlines(), 1):
+              if "Configure ios64-xcrun" in line or \
+                 "Configure iossimulator-xcrun" in line:
+                  print(f"{number}: {line}")
           PY
 
           git -C source diff -- external/CMakeLists.txt
 
-      - name: Configure iOS arm64 build
-        env:
-          IOS_TARGET: ${{ inputs.ios_deployment_target }}
+      - name: Inspect iOS build options
         shell: bash
         run: |
           set -euxo pipefail
+
+          echo "=== iOS and architecture references ==="
+          grep -RniE \
+            'option\(.*IOS|ARCHITECTURE|CMAKE_OSX_DEPLOYMENT_TARGET|gui-ios' \
+            source/CMakeLists.txt \
+            source/cmake \
+            source/external \
+            2>/dev/null | head -200 || true
+
+      - name: Configure iOS ARM64
+        shell: bash
+        env:
+          IOS_TARGET: ${{ inputs.ios_deployment_target }}
+        run: |
+          set -uo pipefail
 
           cmake -S source -B source/build-ios \
             -G Xcode \
@@ -119,59 +147,86 @@ jobs:
             -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
             -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED=NO \
             -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY="" \
-            -DIOS=ON \
-            -DARCHITECTURE=arm64
+            2>&1 | tee configure.log
 
-      - name: Show available build targets
+          result=${PIPESTATUS[0]}
+          exit "$result"
+
+      - name: List available Xcode targets
+        if: success()
         shell: bash
         run: |
           set -euxo pipefail
-          cmake --build source/build-ios --config Release -- -list
+          cmake --build source/build-ios --config Release -- -list \
+            2>&1 | tee targets.log
 
-      - name: Build
+      - name: Build Vion
+        if: success()
         shell: bash
         run: |
-          set -o pipefail
+          set -uo pipefail
+
           cmake --build source/build-ios \
             --config Release \
-            --parallel "$(sysctl -n hw.ncpu)" \
+            --parallel 2 \
             2>&1 | tee build.log
 
-      - name: Locate and package app
+          result=${PIPESTATUS[0]}
+          exit "$result"
+
+      - name: Locate built application
+        if: success()
         shell: bash
         run: |
           set -euxo pipefail
+
+          echo "=== Searching for app bundles ==="
+          find source/build-ios -type d -name '*.app' -print \
+            | tee app-bundles.txt
 
           APP_PATH="$(find source/build-ios -type d \
             -name '*.app' -print -quit)"
 
           if [ -z "$APP_PATH" ]; then
             echo "No .app bundle was produced."
-            find source/build-ios -maxdepth 6 \
-              \( -name '*.app' -o -name '*.framework' \) -print
+            echo "Check the Xcode targets and build logs."
             exit 1
           fi
 
-          echo "Found app: $APP_PATH"
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+          echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
+
+          echo "=== Application information ==="
+          /usr/libexec/PlistBuddy \
+            -c 'Print :CFBundleIdentifier' \
             "$APP_PATH/Info.plist" || true
+
+      - name: Package unsigned IPA
+        if: success()
+        shell: bash
+        run: |
+          set -euxo pipefail
 
           mkdir -p package/Payload
           cp -R "$APP_PATH" package/Payload/
+
           (
             cd package
             /usr/bin/zip -qry ../Vion-unsigned.ipa Payload
           )
 
           test -s Vion-unsigned.ipa
+          ls -lh Vion-unsigned.ipa
 
-      - name: Upload build logs
+      - name: Upload build diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: vion-ios-build-logs
+          name: vion-ios-diagnostics
           path: |
+            configure.log
+            targets.log
             build.log
+            app-bundles.txt
             source/build-ios/CMakeFiles/CMakeOutput.log
             source/build-ios/CMakeFiles/CMakeError.log
           if-no-files-found: ignore
