@@ -1,0 +1,88 @@
+name: ios-dev
+
+# Manual trigger only, so you control when macOS minutes are used.
+on:
+  workflow_dispatch:
+
+env:
+  BOOST_VERSION: "1.86.0"
+
+jobs:
+  ios:
+    # Swift 6 (set in gui-ios/CMakeLists.txt) needs Xcode 16+, which macos-15 provides.
+    runs-on: macos-15
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Check submodules are populated
+        run: |
+          for d in external/dynarmic external/unicorn external/sdl external/ffmpeg-ios; do
+            if [ -z "$(ls -A "$d" 2>/dev/null)" ]; then
+              echo "::error::$d is empty. Push this repo from a real git clone/fork (not an upload of the zip) so submodules are kept."
+              exit 1
+            fi
+          done
+
+      - name: Install tools
+        run: brew install cmake
+
+      # CMakeLists.txt points Boost at /usr/local for iOS, so an iOS-built Boost
+      # must be installed there. BEST EFFORT / UNTESTED: expect to tweak this step.
+      - name: Build Boost for iOS
+        run: |
+          curl -sSL "https://archives.boost.io/release/${BOOST_VERSION}/source/boost_${BOOST_VERSION//./_}.tar.bz2" | tar xj
+          cd "boost_${BOOST_VERSION//./_}"
+          ./bootstrap.sh --with-libraries=filesystem,program_options,system
+          cat > user-config.jam <<'EOF'
+          using darwin : ios : xcrun --sdk iphoneos clang++ -arch arm64 -miphoneos-version-min=16.0 : <cxxflags>-std=c++20 ;
+          EOF
+          sudo ./b2 --user-config=user-config.jam toolset=darwin-ios target-os=iphone \
+            architecture=arm address-model=64 link=static variant=release \
+            --prefix=/usr/local install
+
+      - name: Configure (Xcode generator, iOS)
+        run: |
+          cmake -S . -B build/ios -G Xcode \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
+            2>&1 | tee configure.log
+
+      - name: Build (unsigned)
+        run: |
+          cmake --build build/ios --config Release --target Vion -- \
+            -sdk iphoneos \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            2>&1 | tee build.log
+
+      - name: Package unsigned .ipa
+        run: |
+          APP=$(find build/ios -name 'Vion.app' -type d | head -n1)
+          echo "Found app: $APP"
+          mkdir -p ipa/Payload
+          cp -R "$APP" ipa/Payload/
+          (cd ipa && zip -qry ../Vion-unsigned.ipa Payload)
+
+      - name: Upload .ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: Vion-unsigned-ipa
+          path: Vion-unsigned.ipa
+
+      # Runs even when a step above fails, so you can read errors from your phone.
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: |
+            configure.log
+            build.log
+          if-no-files-found: ignore
